@@ -1,0 +1,382 @@
+---
+title: 'Generative simulations of two-way admixture models'
+output:
+  html_document:
+    df_print: paged
+---
+
+### Goal
+
+Evaluate the relative performances of FA, PC projections, qpAdm and structure (snmf) in simulations with known truth.  
+
+
+```{r}
+library(tfa) 
+library(LEA)
+library(admixr)
+```
+
+
+### Simulating data
+
+The random generator simulates (continuous) genotypes for two ancient ancestral populations, sampled at random times in the past, and a mixed population sampled in present-days. The present day population is identified by 'times = 1', and the samples from ancestral populations have equal sizes. The population-level admixture coefficient is the parameter 'alpha'. 
+
+```{r}
+## simulate hidden factors and genotypes in two-way admixture models
+r_geno_admix <- function (n = 200, #number of samples
+                          p = 10000, #number of SNPs
+                          alpha = 0.5, #Admixture coefficient 
+                          K = 1, # number of factors
+                          times = NULL, # sample dates (increasing order, from the oldest sample to the most recent one = 1)
+                          sigma = 0.1, # residual noise
+                          lambda = 1e-3, # drift parameter  
+                          sd.U = 1.0, # SD for scores (vector of size K)
+                          sd.V = 1.0 # SD for loadings
+                          )
+{
+  
+  if (length(times) != n) stop("Object times not of length n")
+  
+  # Covariance model
+  C <- matrix(NA, n, n)
+  for (i in 1:n){
+    for (j in 1:n)  C[i,j] <- min(times[i], times[j])}
+  
+   # Building latent factors U (n x K)
+  Sigma <- diag(x = sd.U^2, nrow = K, ncol = K)
+  U <- MASS::mvrnorm(n, mu = rep(0, K), Sigma = Sigma)
+
+  U[times == 1, 1] <- rnorm(sum(times == 1), 0, 1)
+  ntm1 <- sum(times < 1)
+  U1 <- c(rnorm(ntm1/2, (1-alpha)*sd.U[1], 1),
+          rnorm(ntm1/2, -alpha*sd.U[1], 1))
+  
+  U[times < 1, 1] <- U1                     
+  
+  U[,1] <- scale(U[,1], scale = F)
+  
+  V <- MASS::mvrnorm(p, mu = rep(0, K), Sigma = sd.V^2 * diag(K))
+  Epsilon <- apply(matrix(rep(0,p),nrow = 1), 2, function(x) rnorm(n,x,sigma))
+  E_brownian <-  t(MASS::mvrnorm(p, mu = rep(0, n), Sigma = (1/lambda)*C))
+  
+  M =  U %*% t(V) + E_brownian + Epsilon
+ 
+ #Returns: U = latent factors, V = loadings, M = data matrix 
+  
+  return(list(M = M,
+              U = U,
+              U1 = U1,
+              V = V))
+}
+```
+
+### Simulation example 
+
+To simulate 200 individuals, 100 of which are from a present-day population resulting from an ancient admixture event between 2 ancestral populations. The admixture rates are 0.25 from population 1 and 0.75 from population  2. The parameter'sdu_1 = 5' indicates that the ancestral populations were moderately differentiated.
+
+```{r}
+sdu_1 <- 5
+lambda_truth <- 15
+sigma <- .1
+sd_v <- sigma
+alpha <- 0.25
+```
+
+
+```{r}
+n = 200 #nb of individuals
+tn <- sort(runif(n)) # sample dates = 1 - ages
+tn[1:100] <- 1.5*tn[1:100] #past
+tn[101:200] <- 1  #100 moderns with date = 1
+
+simu <- r_geno_admix(n = n, 
+                     p = 20000, 
+                     alpha = alpha,
+                     K = 3, 
+                     times = tn, 
+                     sd.U = c(sdu_1, 1.2, 1), 
+                     lambda = lambda_truth, 
+                     sd.V = sd_v, #.2
+                     sigma = sigma)
+```
+
+
+The next plot shows the first two factors, corresponding to the ground truth to be recovered for factor and principal component methods.
+
+
+```{r}
+# ground truth
+pop <- rep(1,n)
+pop[simu$U[,1] < 0 & tn < 1] <- 0
+pop[simu$U[,1] > 0 & tn < 1] <- 2
+col <- NULL
+col[pop == 1] <- "grey80" # present day population
+col[pop == 0] <- "salmon2" # ancestral population
+col[pop == 2] <- "darkblue" # ancestral population
+
+plot(simu$U, cex = 0.5, col = col, pch = 19, main = "Ground truth")
+```
+```{r}
+kmc <- c(mean(simu$U[pop == 0,1]), mean(simu$U[pop == 1,1]), mean(simu$U[pop == 2,1]))
+adm <- (max(kmc) - kmc[kmc < max(kmc) & kmc > min(kmc)])/(max(kmc) - min(kmc))
+cat("Estimated admixture from the ground truth: ")
+a_GT <- min(1 - adm, adm)
+a_GT
+```
+
+By using a probit link function, the continuous data are transformed into binary genotypes as follows: 
+
+```{r}
+Y <- simu$M
+ages <- 1 - tn
+# conversion as binary genotype (0 or 1, haploid data)
+genotype <- rbinom(length(Y), 1, prob = as.numeric(pnorm(Y)))
+Y <- matrix(genotype, nrow = dim(Y)[1])
+
+F0 <- apply(Y[pop == 0, ], 2, mean)
+F2 <- apply(Y[pop == 2, ], 2, mean)
+
+fst = function(f0,f2){ Hs <- (f0*(1-f0) + f2*(1-f2))/2
+H <- (f0 + f2)*(2 - f0 - f2)/4
+1 - Hs/H}
+
+FST <- fst(F0,F2)
+cat("Nei's Fst: ")
+print(mean(FST))
+```
+
+### Choosing lambda for FA
+
+```{r}
+fa  <- tfa(ages,
+            Y,
+            k = 2,
+            lambda = 5e-2,
+            center = TRUE)
+
+r_2 <- choose_lambda(fa,
+                     Y,
+                     min_range = -5,
+                     max_range = 0.01)
+abline(v=log10(1e-3), col = "orange", lty = 2)
+```
+
+
+
+### Running FA analysis
+
+According to the previous analysis, we run FA with `lambda = 5e-3`.
+
+```{r}
+library(tfa)
+fa <- tfa(sample_ages = ages, 
+          k = 2, 
+          Y = Y,
+          lambda = 5e-3)
+Un <- fa$u
+```
+
+
+The estimated admixture coefficients are computed as follows:
+
+```{r}
+cat("Admixture coefficients from the tfa package:\n")
+write.table(file = "./popc.txt",
+            data.frame(paste("id", 1:100, sep = ""),
+                       paste("pop", pop, sep = "")))
+pop.c <- read.table("./popc.txt", as.is = TRUE)
+colnames(pop.c) <- c("Instance.ID","Group.ID")
+meta <- as.tfa_metadata(pop.c)
+
+a_TFA <-  ancestry_coefficients(model = fa,
+                      metadata = meta,
+                      source = c("pop0", "pop2"), 
+                      target = "pop1", individual = FALSE)
+a_TFA
+a_TFA <- min(a_TFA)
+```
+
+The graphical result is close to the ground truth. 
+
+```{r}
+plot(Un, col = col, 
+     pch =  c(rep(19,100), rep(8, 100)), 
+     cex = .6, 
+     main = "FA", 
+     xlab = "Factor 1", 
+     ylab = "Factor 2",
+     las = 1)
+abline(0,0, col = "yellow4", lty = 2)
+```
+
+
+### PC projections of ancient samples on present-day samples 
+
+To compute PC projections of ancient samples on present-day samples,  we start by performing a PCA on the present-day samples.
+
+```{r}
+pc <- prcomp(Y[pop == 1,], scale = FALSE) 
+
+c_mean <- apply(Y[pop == 1,], 2, mean)
+G <- t(t(Y) - c_mean)
+```
+
+The projections of ancient samples on present-day PCs are computed as follows.
+
+```{r}
+Vn <- rbind(G[pop != 1,] %*% pc$rotation , pc$x)
+Vn <- prcomp(Vn[,1:2])$x
+```
+
+The estimated ancestry coefficient is close to the truth:
+
+```{r}
+kmc <- c(mean(Vn[pop == 0,1]), mean(Vn[pop == 1,1]), mean(Vn[pop == 2,1]))
+adm <- (max(kmc) - kmc[kmc < max(kmc) & kmc > min(kmc)])/(max(kmc) - min(kmc))
+cat("Coefficient d'admixture pc-proj: ")
+a_PC <- min(1 - adm, adm)
+a_PC
+```
+But the plot exhibits a shrinkage bias, in which ancient samples are mixed with present-day samples.
+
+```{r}
+plot(Vn, 
+     main = "PCA",  
+     xlab = "Axis 1", 
+     ylab = "Axis 2",
+     col = col, 
+     cex = .6, 
+     pch =  c(rep(19,100), rep(8, 100)),
+     las = 1)
+
+abline(0,0, col = "yellow4", lty = 2)
+points(cbind(kmc,rep(0,3)), cex = 2, col = "grey20", lwd = 3, pch = 3)
+```
+
+
+### Using qpAdm with idealized outgroups
+
+In this section, we run qpAdm (having admixtools installed in the OS). Before running the following code chunks, it is necessary to create a folder named **snps**.
+
+Three artificial outgroup/reference individuals are created, differing from the 200 samples at 400 private SNPs: "og1" and "og2" are the closest outgroups to the ancestral populations and "ogall" is the most distant outgroup. The modified genotypic matrix is Yo.
+
+```{r}
+NPRIV = 400
+NPRIV1 = round(NPRIV/4,0)
+NPRIV2 = round(NPRIV/4,0)
+NPRIVO = round(NPRIV/2,0)
+
+Yo <- cbind(Y, matrix(0, nrow = nrow(Y), ncol = NPRIV))
+og1 <- Yo[ which(pop == 0)[1] ,]
+og1[ncol(Y) + (1:NPRIV1)] <- sample(1:2, NPRIV1, replace= TRUE)
+
+
+og2 <- Yo[which(pop == 2)[1],]
+og2[ncol(Y) + NPRIV1 + (1:NPRIV2)] <- sample(1:2, NPRIV2, replace= TRUE)
+
+ogall <- og2
+ogall[ncol(Y) + NPRIV1 + NPRIV2 + (1:NPRIVO)] <- sample(1:2, NPRIVO, replace= TRUE)
+
+Yo <- rbind(Yo, og1, og2, ogall)
+
+write.geno(R = Yo, output.file = "./snps/snps.geno")
+```
+
+Next, we need to create some files specific to the `admixtools` format.
+
+```{r}
+indfile <- data.frame(paste("I", 1:nrow(Yo), sep = ""), 
+                      sample(c("M","F"), nrow(Yo), rep = TRUE), 
+                      c(paste("pop", pop, sep = ""), "og0", "og2", "og_all"))
+write.table(file = "./snps/snps.ind", indfile, quote = F, row.names = F, col.names = F)
+```
+
+and:
+
+```{r}
+snpfile <- data.frame(paste("rs", 1:ncol(Yo), sep = ""), 
+                      rep(1,ncol(Yo)),
+                      round((1:ncol(Yo))/ncol(Yo), digit = 5),
+                      1:ncol(Yo),
+                      rep("C", ncol(Yo)),
+                      rep("G", ncol(Yo)))
+write.table(file = "./snps/snps.snp", snpfile, quote = F, row.names = F, col.names = F)
+```
+
+
+The result is as follows:
+```{r}
+snps <- eigenstrat("./snps/snps")
+
+result <- qpAdm(
+  target = "pop1",
+  sources = c("pop2","pop0"),
+  outgroups = c("og0", "og2", "og_all"),
+  data = snps
+)
+
+result$proportions
+```
+
+In summary, the estimated admixture coefficient is equal to
+
+
+```{r}
+cat("qpAdm estimated admixture coefficient: ")
+a_qpADM <-  as.numeric(result$proportions[1,2])
+a_qpADM 
+```
+
+
+### STRUCTURE (snmf) analysis
+
+In this section, we estimate the admixture coefficient with the program `snmf` which is similar to STRUCTURE or ADMIXTURE, but faster and available in R. 
+
+```{r}
+write.geno(R = Y, output.file = "./y.geno")
+```
+
+
+```{r}
+k = 2
+project.snmf = snmf("./y.geno",
+                    K = k, 
+                    entropy = TRUE, 
+                    repetitions = 1,
+                    alpha = 1000)
+```
+```{r}
+my.colors <- c("darkblue", "salmon2","grey80")
+qmatrix <- Q(project.snmf, K = k)
+cat("STRUCTURE admixture coefficient: ")
+adm <- mean(qmatrix[101:200, 1])
+a_STR <- min(adm, 1 - adm)
+a_STR
+```
+
+```{r}
+barchart(project.snmf, K = k, sort.by.Q = FALSE, 
+         col = my.colors, border = NA, space = 0,
+         xlab = "Individuals", ylab = "Ancestry proportions", 
+         main = "Ancestry matrix") -> bp
+
+axis(1, at = 1:length(bp$order), 
+     labels = bp$order, las = 3, cex.axis = .4)
+```
+
+```{r}
+remove.snmfProject("y.snmfProject")
+```
+
+
+```{r}
+round(data.frame(
+  true_rate = alpha, 
+  ground_truth = a_GT,
+  FA = a_TFA,
+  PC = a_PC,
+  qpADM = a_qpADM,
+  structure = a_STR), digit = 4)
+```
+
+
